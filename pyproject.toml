@@ -1,0 +1,147 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "purgedcv"
+version = "0.1.6"
+description = "scikit-learn-compatible cross-validation for time-series and financial machine learning: purging, embargoes, combinatorial purged CV, and deflated Sharpe ratios."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Evgenii Lazarev" }]
+keywords = [
+    "cross-validation",
+    "time-series",
+    "time-series-cross-validation",
+    "time-series-split",
+    "purged-cross-validation",
+    "purged-kfold",
+    "purging",
+    "embargo",
+    "combinatorial-purged-cross-validation",
+    "cpcv",
+    "walk-forward",
+    "data-leakage",
+    "backtesting",
+    "backtest",
+    "deflated-sharpe-ratio",
+    "probabilistic-sharpe-ratio",
+    "model-validation",
+    "scikit-learn",
+    "sklearn",
+    "machine-learning",
+    "financial-machine-learning",
+    "quantitative-finance",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Typing :: Typed",
+    "Natural Language :: English",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "hypothesis>=6.80",
+    "polars>=0.20",
+    "black>=24.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pandas-stubs>=2.0",
+    "pre-commit>=3.5",
+]
+examples = [
+    "jupyter>=1.0",
+    "matplotlib>=3.7",
+    "pricehub>=0.0.7",
+    "optuna>=3.0",
+]
+optuna = [
+    "optuna>=3.0",
+]
+docs = [
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.24",
+    "mkdocs-include-markdown-plugin>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/eslazarev/purged-cross-validation"
+Repository = "https://github.com/eslazarev/purged-cross-validation"
+Documentation = "https://eslazarev.github.io/purged-cross-validation/"
+Issues = "https://github.com/eslazarev/purged-cross-validation/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/purgedcv"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["src", "tests"]
+addopts = "-ra --strict-markers --strict-config --doctest-modules"
+markers = [
+    "e2e: end-to-end tests exercising the public API as a user would (may spawn subprocesses)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "UP",
+    "N",
+    "SIM",
+    "RUF",
+]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["N802"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312", "py313", "py314"]
+
+[tool.mypy]
+strict = true
+warn_return_any = true
+warn_unused_configs = false
+warn_unreachable = true
+show_error_codes = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["hypothesis.*", "sklearn.*", "scipy.*"]
+ignore_missing_imports = true

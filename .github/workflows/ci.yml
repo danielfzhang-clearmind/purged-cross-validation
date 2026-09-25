@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,docs]"
+
+      - name: Ruff lint
+        run: ruff check .
+
+      - name: Black format check
+        run: black --check src tests tools examples/_lcl_harness.py
+
+      - name: Mypy (strict)
+        run: mypy src tests
+
+      - name: Pytest
+        run: pytest -q --cov=purgedcv --cov-report=xml --cov-report=term
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.12'
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.xml
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          verbose: true
+
+      - name: Mkdocs build (strict)
+        run: mkdocs build --strict
+
+  # Validate the citation metadata and guard against version drift. Runs
+  # once (not across the Python matrix) because it is a static-file check.
+  citation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate CITATION.cff against the CFF schema
+        run: |
+          python -m pip install --upgrade pip cffconvert
+          cffconvert --validate
+
+      - name: Check CITATION.cff version matches pyproject.toml
+        run: python tools/sync_citation.py --check
+
+  # Decide whether this push changed the shipped package itself
+  # (src/ or pyproject.toml). Gates the release job below: merges that
+  # only touch docs, CI, tooling, tests, or examples must not publish a
+  # PyPI release or bump the version. Docs still redeploy to GitHub
+  # Pages via the separate docs.yml workflow.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect package changes
+        id: detect
+        run: |
+          before='${{ github.event.before }}'
+          after='${{ github.sha }}'
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+            echo "Unknown base commit; allowing release."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$before" "$after")
+          echo "Changed files:"
+          echo "$changed"
+          if [ -z "$changed" ]; then
+            echo "No files changed; skipping release."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Release only when the shipped package changes: src/** or
+          # pyproject.toml. Docs, CI, tooling, tests, and examples do
+          # not change the wheel and must not bump the version.
+          code=$(echo "$changed" | grep -E '^(src/|pyproject\.toml$)' || true)
+          if [ -n "$code" ]; then
+            echo "Package files changed; release will run."
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No package changes; release will be skipped."
+            echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Bump first, then release that exact version, so git and PyPI never
+  # disagree: after a release main holds the version that is on PyPI, not
+  # one ahead. The bump commit is pushed and tagged before the irreversible
+  # PyPI upload (the last step), so a failed upload never leaves PyPI ahead
+  # of git; --skip-existing makes a re-run safe. The version in pyproject.toml
+  # is therefore the LAST published version; merging a package change releases
+  # the next patch. Skipped when a merge changes no package files (see the
+  # changes job above).
+  release:
+    needs: [test, changes]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      github.actor != 'github-actions[bot]' &&
+      needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+          pip install -e ".[dev]"
+
+      - name: Bump version for this release
+        id: bump
+        run: |
+          new=$(python - <<'PY'
+          import re, pathlib
+          pyproject = pathlib.Path("pyproject.toml")
+          init = pathlib.Path("src/purgedcv/__init__.py")
+          t = pyproject.read_text()
+          m = re.search(r'(?m)^version = "(\d+)\.(\d+)\.(\d+)(?:a(\d+))?"$', t)
+          if not m:
+              raise SystemExit('expected version = "X.Y.Z" or "X.Y.ZaN" in pyproject.toml')
+          maj, mnr, pat = map(int, m.groups()[:3])
+          alpha = m.group(4)
+          if alpha is None:
+              nv = f"{maj}.{mnr}.{pat + 1}"
+          else:
+              nv = f"{maj}.{mnr}.{pat}a{int(alpha) + 1}"
+          pyproject.write_text(t[: m.start()] + f'version = "{nv}"' + t[m.end() :])
+          init_text = init.read_text()
+          new_init = re.sub(r'(?m)^__version__ = "[^"]+"$', f'__version__ = "{nv}"', init_text)
+          if new_init == init_text:
+              raise SystemExit('failed to match __version__ in src/purgedcv/__init__.py')
+          init.write_text(new_init)
+          print(nv)
+          PY
+          )
+          echo "release=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Sync CITATION.cff to the released version
+        run: python tools/sync_citation.py --write --date "$(date -u +%F)"
+
+      - name: Commit version bump
+        id: commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add pyproject.toml src/purgedcv/__init__.py CITATION.cff
+          git commit -m "chore: release v${{ steps.bump.outputs.release }}"
+          git push
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: python -m build
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.bump.outputs.release }}"
+          target_commitish: ${{ steps.commit.outputs.sha }}
+          name: "v${{ steps.bump.outputs.release }}"
+          body: "Automated release of v${{ steps.bump.outputs.release }}."
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # PyPI upload is the last step on purpose: it is the only irreversible
+      # action here (a version number cannot be re-uploaded once taken, even
+      # after deletion). By the time we reach it the git side is already
+      # consistent (the bumped commit, tag v<version>, and the GitHub release
+      # exist), so a failed upload never leaves PyPI ahead of git, and
+      # --skip-existing makes a re-run safe.
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: ${{ secrets.PYPI_USERNAME }}
+          TWINE_PASSWORD: ${{ secrets.PYPI_PASSWORD }}
+        run: twine upload --non-interactive --skip-existing dist/*

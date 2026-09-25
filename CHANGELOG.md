@@ -1,0 +1,375 @@
+# Changelog
+
+All notable changes to `purged-cross-validation` are recorded here. The
+format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+The 0.0.x series is the pre-1.0 development line. The library's feature
+work was organised internally as Plans A–D (foundations → splitters →
+backtest paths → metrics); the cumulative feature set delivered by each
+Plan is listed under the published version it shipped in.
+
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** purge, `horizons_overlap`, and the leakage diagnostics now
+  treat label horizons as closed intervals `[prediction_time, evaluation_time]`,
+  matching AFML Section 7.4.1 and Snippet 7.1. Training labels that only touch
+  a test label (end exactly when it starts, or start exactly when it ends) are
+  now purged. Splits with one-step labels (`evaluation = prediction + 1 step`)
+  no longer degrade to plain `KFold`/`TimeSeriesSplit`; zero-length labels do.
+- **Breaking:** `embargo_observations` and `embargo_fraction` now count rows
+  from the end of each test block's labels (the last row whose prediction time
+  is at or before the block's latest evaluation time), as in AFML Snippets
+  7.2/7.3, instead of from the block's last row. Previously the positional
+  embargo was largely absorbed by the purge zone.
+
+### Added
+
+- Public `PBOResult` and `DSRDiagnostics` result dataclasses, plus the
+  `HorizonLike`, `PathMetricFn`, and `PerformanceMetric` callback/input type
+  aliases, are now importable directly from `purgedcv` for typed downstream
+  code without reaching into private modules.
+- New public `audit_splitter(cv, X)` diagnostic returns one DataFrame row per
+  fold with candidate and final train sizes, purge/embargo/finalization
+  removal counts, indices added during custom finalization,
+  `candidate_overlap_fraction` and `final_overlap_fraction`, train/test time
+  envelopes with contiguous-block counts, train non-emptiness, and
+  group-disjointness status. It consumes the splitters' real
+  candidate → purged → embargoed stages instead of inferring removal counts
+  from final indices; leakage is reported rather than raised. Subclasses that
+  override `split()` are rejected because their returned folds can diverge
+  from that auditable pipeline, and custom final indices are validated for
+  positional correctness and uniqueness.
+- Embargo can now be expressed in three mutually exclusive ways throughout
+  the splitter, PBO, row-level, and diagnostics APIs: a wall-clock duration
+  (`embargo`), a fixed number of post-test rows (`embargo_observations`), or a
+  fraction of the full dataset (`embargo_fraction`). Fractional embargo uses
+  `floor(n_samples * embargo_fraction)` observations. Positional modes apply
+  independently after every contiguous test block, including non-adjacent
+  CPCV groups, and preserve the established duration-based behavior.
+
+## [0.1.3] - 2026-08-01
+
+### Added
+
+- Time inputs are now framework-agnostic. `prediction_times` and
+  `evaluation_times` on every splitter, together with `purge`, `apply_embargo`,
+  `validate_times`, and the `diagnostics` functions, accept pandas
+  `Series`/`DatetimeIndex`, NumPy `datetime64`/`timedelta64` arrays, Python
+  lists of datetime/Timestamp/timedelta values, and polars `Series`. Inputs are
+  coerced to a 1-D NumPy array once at the public boundary; polars is
+  duck-typed through `.to_numpy()` and never imported, so it stays out of the
+  runtime dependencies. tz-aware pandas input is normalized to UTC. `groups`
+  accepts the same containers but holds arbitrary 1-D labels, not timestamps.
+  The pandas input path is unchanged; the widened public signatures use the new
+  exported `TimesLike` (times) and `ArrayLike1D` (labels) type aliases.
+
+## [0.1.2] - 2026-06-13
+
+### Documentation
+
+- Quickstart now shows how to pass `sample_weight` through the splitters.
+  Because the splitters stay drop-in to scikit-learn and ship no scorer of
+  their own, weights travel via sklearn metadata routing
+  (`enable_metadata_routing`, `set_fit_request`/`set_score_request`); the
+  section covers both train-time-only weighting and weighting the score
+  through a custom scorer, and the `UnsetMetadataPassedError` it raises if
+  the scorer neither requests nor declines the weight.
+- `path_metrics` docstring states the `max_drawdown` sign convention at the
+  point of use (positive magnitude; worst path is `idxmax`, not `idxmin`),
+  matching the note already in `default_backtest_metrics`.
+
+## [0.1.1] - 2026-06-05
+
+### Added
+
+- `minimum_backtest_length` (MinBTL): the backtest length, in years, below
+  which a reported annualised Sharpe is within what selecting the best of
+  `n_trials` independent backtests produces by chance under the null. It is
+  the inverse of the Deflated Sharpe Ratio deflation, reusing the same
+  Bailey-Lopez de Prado expected-maximum bracket term, and finishes the
+  AFML Chapter 11 selection-bias toolset (PSR, DSR, PBO, MinTRL) in-package.
+  Implements Bailey, Borwein, Lopez de Prado & Zhu (2014), "Pseudo-mathematics
+  and financial charlatanism".
+
+## [0.1.0] - 2026-06-05
+
+First minor release. The version bump from the `0.0.x` line signals that
+the public API in `purgedcv/__init__.py` is now considered usable and is
+maintained deliberately: the splitters, backtest-path reconstruction, and
+the Sharpe-ratio metric family are stable enough to build on. Breaking
+changes will still happen before `1.0.0`, but they will be noted here
+rather than slipped into a patch release.
+
+### Added
+
+- `probability_of_backtest_overfitting` (PBO): estimates how often the
+  configuration chosen as best in-sample lands below the median
+  out-of-sample, using Combinatorially Symmetric Cross-Validation (CSCV).
+  Returns a frozen `PBOResult` dataclass (read fields by attribute):
+  the PBO value, the per-combination logits, the IS-versus-OOS
+  performance-degradation slope, and the IS/OOS performance pairs. When
+  prediction and evaluation times are supplied it cleans every IS/OOS
+  boundary with the existing purge and embargo machinery. Implements
+  Bailey, Borwein, Lopez de Prado & Salehipour (2017) and AFML Chapter 11.
+- `CombinatoriallySymmetricCV`: the CSCV splitter that PBO is built on,
+  exposed directly. It is `CombinatorialPurgedCV` with
+  `n_test_groups = n_splits // 2` (even `n_splits` required).
+- `deflated_sharpe_ratio_full`: returns a frozen `DSRDiagnostics` dataclass
+  with the Deflated Sharpe probability alongside the quantities that explain
+  it (observed Sharpe, deflated benchmark `sr_star`, the standardized
+  expected-maximum multiplier `expected_max_z`, `var_sharpe`, `n_trials`,
+  track-record length, skew, and kurtosis). The scalar
+  `deflated_sharpe_ratio` keeps its scalar return. Both gained an optional
+  `bars_per_year`: `var_sharpe` is per-observation by default, and passing
+  `bars_per_year` converts an annualised Sharpe variance to per-observation
+  internally. This closes the unit trap where `path_metrics(...,
+  bars_per_year=...)` returns an annualised Sharpe whose variance does not
+  match the per-observation contract DSR requires.
+- `path_metrics` and `default_backtest_metrics`: reduce an
+  `(n_paths, n_samples)` CPCV path matrix to a per-path DataFrame of
+  Sharpe, Calmar, max drawdown, and total return in one call.
+- `CombinatorialPurgedCV.reconstruct_paths(fold_predictions)`: an
+  instance method that assembles per-fold predictions into backtest paths
+  without the caller restating `n_splits`, `n_test_groups`, or
+  `n_samples`. Complements the existing free `reconstruct_paths` function.
+- `purgedcv.optuna_integration.TrialSharpeRecorder`: an Optuna study
+  callback that collects per-trial Sharpe ratios and reports the
+  `var_sharpe` and trial count that `deflated_sharpe_ratio` needs, plus
+  `n_effective()` for the autocorrelation-adjusted count. Importing the
+  module does not require Optuna; the `optuna` optional extra
+  (`pip install purgedcv[optuna]`) installs it for the surrounding
+  optimisation loop.
+- `effective_n_trials`: estimates the number of *independent* trials behind
+  a correlated search (TPE, CMA-ES) from the integrated autocorrelation time
+  of the trial-performance series. Pass it to `deflated_sharpe_ratio` so a
+  6000-trial TPE run is not deflated as if all 6000 were independent, which
+  otherwise crushes DSR to zero. Documented as a heuristic.
+- New example `examples/optuna_dsr_cookbook.py`: the canonical end-to-end
+  Optuna + Deflated Sharpe pattern (record per-trial Sharpe, deflate by the
+  effective trial count, convert annualised `var_sharpe` via `bars_per_year`)
+  that most users will write.
+- New example notebook `examples/backtest_overfitting_audit.ipynb`: a seeded
+  Optuna TPE search over a Ridge strategy on real BTC/USDT daily data, audited
+  end to end with PBO, `effective_n_trials`, `deflated_sharpe_ratio_full`
+  (with `bars_per_year`), and `CombinatorialPurgedCV.backtest_paths` plus
+  `path_metrics`. The search reaches an in-sample Sharpe of +2.5; the audit
+  shows PBO 0.55, the 400 TPE trials worth about 25 independent bets, and a
+  modest deflated Sharpe, while the per-path spread confirms the model family
+  does carry real structure on this trending window.
+- `optuna` added to the `examples` optional-dependency extra so the gallery
+  runs with `pip install purgedcv[examples]`.
+- Python 3.13 and 3.14 are now part of the CI test matrix and listed
+  among the supported versions.
+- New example notebook `examples/selection_regret_lcl.ipynb`: on UK
+  Low Carbon London smart-meter data, `PurgedGroupKFold` picks a model
+  that deploys with 5 to 12% lower MAE on 12 truly unseen households
+  than naive shuffled `KFold` does. Holds across 5 random seeds.
+  Companion to `synthetic_leakage_proof.ipynb`: same library, opposite
+  framing (negative proof of fabricated skill there; positive
+  demonstration of selection regret here).
+- New example notebook `examples/selection_regret_crypto.ipynb`: same
+  selection-regret protocol on daily BTC/USDT 2021-2023. The naive
+  selector picks a deep RandomForest with apparent CV MAE 0.057; on
+  180 truly held-out bars it deploys at R² = -1.64 and Sharpe = -0.77.
+  `PurgedKFold` picks Ridge with `alpha=100` (R² = +0.01, Sharpe =
+  -0.26 on the same bars). Both strategies lose money over the
+  sideways-down deployment window, but the naive pick loses three to
+  five times more per unit of risk. The library's value on a no-edge
+  market is loss avoidance rather than gain.
+
+### Changed
+
+- `min_track_record_length` now returns `math.inf` instead of raising when
+  `observed_sharpe <= target_sharpe`: no finite track record can establish
+  a gap that is not there, and infinity is the well-defined answer. The
+  return type is now `float` (wrap in `int(...)` for a count when finite).
+  Other input validation (`alpha` range, non-finite inputs) still raises.
+- `validate_times` now requires a datetime-like or timedelta-like dtype
+  for `prediction_times` and `evaluation_times`. Numeric, string, and
+  object-dtype series are rejected; convert with `pd.to_datetime` first.
+- `parse_horizon` rejects `NaT` and other missing horizons.
+- The splitter constructors and `assert_groups_disjoint` reject missing
+  (`NaN`) group labels instead of grouping on `NaN`.
+- `purge` and `apply_embargo` validate the horizon before the
+  empty-index short-circuit, so a bad horizon fails fast even when the
+  train or test set is empty.
+- The automated release job now runs only when a merge changes the
+  shipped package (`src/` or `pyproject.toml`); documentation, CI,
+  tooling, test, and example changes no longer publish a release. This
+  generalises the documentation-only skip rule introduced in 0.0.9.
+
+### Fixed
+
+- `deflated_sharpe_ratio` returned `1.0` for every input when
+  `n_trials=1`. The single-trial branch set the deflated benchmark SR\*
+  to `-inf`; it now uses SR\* = 0, so DSR reduces to
+  `probabilistic_sharpe_ratio(returns, 0.0)`. A losing strategy is no
+  longer reported as certain skill. Covered by a regression test.
+- `WalkForwardSplit(window="sliding", train_size=0)` silently used the
+  entire history as the train window, because `arr[-0:]` selects the
+  whole array. `train_size` is now validated as a positive integer.
+- `purge` and `apply_embargo` silently accepted negative or `NaT`
+  horizons; they now raise `ValueError`.
+- `reconstruct_paths` accepted `fold_test_indices` that did not match
+  the canonical CPCV group layout and produced a wrong path matrix; it
+  now verifies the layout and rejects mismatches.
+- `CombinatorialPurgedCV` accepted `n_splits > n_samples`, which builds
+  empty group blocks; this is now rejected at construction.
+- The metrics functions accepted non-finite inputs (infinite or `NaN`
+  returns, `benchmark_skill`, `var_sharpe`, and the scalar arguments of
+  `min_track_record_length`) and non-integer `n_trials`, producing
+  meaningless probabilities. They now raise. `min_track_record_length`
+  with `alpha >= 0.5` no longer returns an inflated length.
+- The splitter integer parameters (`n_splits`, `test_size`,
+  `train_size`, `n_test_groups`) are validated at construction; floats
+  and booleans are rejected with `TypeError`.
+
+## [0.0.9] - 2026-05-22
+
+No library code changed in this release; the published wheel is
+identical to v0.0.7. The release carried CI and example tooling only.
+
+### Added
+
+- The CI workflow detects whether a push touched files outside the
+  documentation surface and skips the automated release job for
+  documentation-only merges to `main`, so editing documentation no
+  longer publishes a PyPI release or bumps the version.
+
+### Fixed
+
+- Import ordering in `examples/synthetic_leakage_proof.ipynb`
+  (ruff `I001`).
+
+## [0.0.8] - 2026-05-21
+
+Intermediate empty auto-release patch. No library, CI, or documentation
+changes.
+
+## [0.0.7] - 2026-05-20
+
+This project publishes a patch release automatically on every push to
+`main`. Versions 0.0.5 and 0.0.6 were intermediate same-day auto-release
+patches; this entry records the work delivered across 0.0.5 through
+0.0.7.
+
+### Added
+
+- JOSS submission paper at `docs/paper.md` (`docs/paper.bib`) with the
+  real ORCID baked in.
+- Hosted documentation site at
+  <https://eslazarev.github.io/purged-cross-validation/> using
+  MkDocs Material + mkdocstrings, deployed by
+  `.github/workflows/docs.yml`. The PR check in `ci.yml` runs
+  `mkdocs build --strict`.
+- Community files required for JOSS verification: `CITATION.cff`,
+  `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1),
+  `.zenodo.json`, issue and pull-request templates.
+- Full-population UK Low Carbon London benchmark
+  (`tools/lcl_full_benchmark.py`) — chunked enumeration over the raw
+  ~8 GB corpus, K seeded subsamples of N households, mean ±95% t-interval.
+  Real result (K=20, N=60, seed=0, 4,284 eligible households): temporal
+  leak 1.60% (95% CI 1.27 – 1.94%), household leak 6.03% (95% CI
+  4.93 – 7.12%). End-to-end test `test_e2e_lcl_full_benchmark.py`.
+- Controlled competitor benchmark (`tools/competitor_benchmark.py`) and
+  the empirical write-up at `paper/competitor_benchmark.md` — on the
+  controlled task `purgedcv` admits 0.000 label overlap while default
+  `KFold(shuffle=True)` fabricates R² = +0.92; mlfinpy is shown to be
+  broken on pandas ≥ 2.0; RiskLabAI does not install on a modern stack.
+  End-to-end test `test_e2e_competitor_benchmark.py`.
+- `context7.json` so the docs are indexable by Context7.
+
+
+### Changed
+
+- `BaseTemporalSplitter` now requires monotonic `prediction_times` at
+  construction (`require_monotonic=True`). Closes a silent
+  train-from-future failure mode in `WalkForwardSplit`.
+- `purge`, `apply_embargo`, and the diagnostics no longer collapse
+  separated test blocks into one global interval. The new
+  `src/purgedcv/_intervals.py` provides `overlaps_any_half_open_interval`
+  and `points_in_any_closed_interval`; both filters operate on the union
+  of local per-row intervals. Fixes CPCV folds with non-adjacent test
+  groups and the artificial-NaN paths (`energy_demand_pjm` notebook now
+  reports 0.0% NaN paths instead of 100%).
+- Embargo is now applied per test row (`[eval_i, eval_i + embargo]`
+  unioned across the fold) rather than only after `max(eval)`. For
+  contiguous PurgedKFold this is strictly more conservative; for CPCV
+  with non-adjacent groups it is the correct generalisation.
+
+### Fixed
+
+- Version desync between `pyproject.toml` and
+  `src/purgedcv/__init__.py`. The release workflow now bumps both files
+  (alpha-aware), and the new install-smoke test
+  `test_packaging_metadata_versions_match_runtime` fails CI if they
+  drift again.
+
+## [0.0.4] - 2026-05-17
+
+By v0.0.4 the cumulative feature set of Plans A through D below was
+delivered.
+
+### Plan D — Domain D7: statistical metrics
+
+- `probabilistic_sharpe_ratio(returns, benchmark_skill)` — probability that the true Sharpe ratio exceeds a benchmark, corrected for non-normality (Bailey & López de Prado 2012).
+- `deflated_sharpe_ratio(returns, n_trials, var_sharpe)` — PSR adjusted for multiple-comparison bias across independent strategy evaluations (Bailey & López de Prado 2014).
+- `min_track_record_length(observed_sharpe, target_sharpe, alpha, skew, kurtosis)` — minimum sample size required for PSR to exceed `1 − alpha` at the observed Sharpe; the analytical inverse of PSR.
+
+### Plan C — Domain D6: CPCV backtest path reconstruction
+
+- `reconstruct_paths(fold_predictions, fold_test_indices, n_splits, n_test_groups, n_samples)` — pure function that combines the C(N,K) fold outputs into the C(N−1,K−1) canonical backtest paths described in López de Prado (2018) chapter 12.
+- `CombinatorialPurgedCV.backtest_paths(estimator, X, y)` — convenience method that runs the full CPCV fit-predict loop and calls `reconstruct_paths`, returning an `(n_paths, n_samples)` float array with `NaN` for unseen observations.
+
+### Plan B — Domains D4 + D5: splitter framework
+
+- `BaseTemporalSplitter` (D4) — abstract base class wiring `purge` + `apply_embargo` into every fold produced by concrete subclasses; enforces group disjointness when `groups` are supplied.
+- `WalkForwardSplit` (D5.1) — sliding-window and expanding-window walk-forward CV; configurable `train_size`, `test_size`, and `step`; `with_times` adapter for fluent construction.
+- `PurgedKFold` (D5.2) — contiguous test folds tiling the index space, with purge and embargo applied; degrades to standard `KFold(shuffle=False)` at zero purge/embargo.
+- `PurgedGroupKFold` (D5.3) — group-aware variant of `PurgedKFold` that assigns whole groups to folds so no entity leaks across the train/test boundary.
+- `CombinatorialPurgedCV` (D5.4) — exhaustive C(N, K) combinatorial fold enumeration for producing multiple backtest paths from a single dataset.
+- scikit-learn integration: every splitter satisfies the `sklearn.model_selection` splitter protocol and works inside `cross_val_score`, `GridSearchCV`, and `Pipeline`.
+
+### Plan A — Foundations: Domains D1 + D2 + D3 + D8
+
+- `parse_horizon`, `horizons_overlap`, `validate_times` (D1) — time and horizon utilities; strict validation of monotonicity, NaN-freedom, and chronological ordering.
+- `purge` (D2) — drops training rows whose half-open label horizon `[prediction_time, evaluation_time)` overlaps the test horizon; implements AFML Section 7.4.1 Snippet 7.1.
+- `apply_embargo` (D3) — drops training rows whose `prediction_time` falls in the post-test asymmetric embargo window `[test_eval_max, test_eval_max + embargo]`.
+- `purgedcv.diagnostics` submodule (D8) — `assert_no_temporal_leakage`, `assert_embargo_respected`, `assert_groups_disjoint`, `compute_overlap_fraction` for auditing custom splits.
+- Exception hierarchy — `TemporalCVError`, `TemporalLeakageError`, `EmbargoViolationError`, `GroupLeakageError`.
+- src-layout Python package using hatchling as the build backend.
+- TDD test suite with hypothesis property tests; ruff + mypy strict + pre-commit quality gates.
+
+### Examples (added across 0.0.x development)
+
+- Worked-example notebook gallery on real public data: PhysioNet ICU
+  mortality, NASA C-MAPSS turbofan RUL, NOAA GHCN-Daily rainfall, PJM
+  hourly load, Binance BTC/USDT, UK Low Carbon London smart meters, USGS
+  earthquakes, UCI air quality, Premier League matches, and a controlled
+  synthetic leakage proof.
+
+## [0.0.3] - 2026-05-16
+
+Development patch release.
+
+## [0.0.2] - 2026-05-16
+
+Development patch release.
+
+## [0.0.1] - 2026-05-16
+
+First PyPI release.
+
+[Unreleased]: https://github.com/eslazarev/purged-cross-validation/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.1.3
+[0.1.2]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.1.2
+[0.1.1]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.1.1
+[0.1.0]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.1.0
+[0.0.9]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.0.9
+[0.0.8]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.0.8
+[0.0.7]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.0.7
+[0.0.4]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.0.4
+[0.0.3]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.0.3
+[0.0.2]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.0.2
+[0.0.1]: https://github.com/eslazarev/purged-cross-validation/releases/tag/v0.0.1

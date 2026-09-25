@@ -1,0 +1,305 @@
+"""Unit tests for purgedcv._embargo (Domain D3)."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from purgedcv._embargo import apply_embargo
+from purgedcv._typing import NDArrayAny
+
+
+def _make_horizon_dataset(horizon_days: int = 1, n: int = 20) -> tuple[pd.Series, pd.Series]:
+    pred = pd.Series(pd.date_range("2024-01-01", periods=n, freq="D"))
+    evalu = pred + pd.Timedelta(days=horizon_days)
+    return pred, evalu
+
+
+class TestApplyEmbargo:
+    def test_zero_embargo_is_identity(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.arange(20)
+        test_idx = np.arange(5, 10)
+        result = apply_embargo(train_idx, test_idx, pred, evalu, embargo=pd.Timedelta(0))
+        np.testing.assert_array_equal(result, train_idx)
+
+    def test_rejects_negative_embargo(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        with pytest.raises(ValueError, match="non-negative"):
+            apply_embargo(
+                np.arange(20),
+                np.arange(5, 10),
+                pred,
+                evalu,
+                embargo=pd.Timedelta(days=-1),
+            )
+
+    def test_rejects_missing_embargo(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        with pytest.raises(ValueError, match="non-missing"):
+            apply_embargo(
+                np.arange(20),
+                np.arange(5, 10),
+                pred,
+                evalu,
+                embargo=pd.NaT,  # type: ignore[arg-type]
+            )
+
+    def test_drops_first_post_test_sample(self) -> None:
+        """Closed window [eval_max, eval_max+embargo]. Test ends Jan 11
+        (evalu[9]=Jan 11). embargo=1D -> cutoff Jan 12. Train row 11 has
+        pred=Jan 12 -> in [Jan 11, Jan 12] -> dropped. Rows 12..14 (pred
+        Jan 13..Jan 15) are past cutoff -> kept."""
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.arange(11, 15)
+        test_idx = np.arange(5, 10)
+        result = apply_embargo(train_idx, test_idx, pred, evalu, embargo=pd.Timedelta(days=1))
+        np.testing.assert_array_equal(result, np.array([12, 13, 14]))
+
+    def test_oversized_embargo_drops_all_post_test(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.arange(11, 20)
+        test_idx = np.arange(5, 10)
+        result = apply_embargo(train_idx, test_idx, pred, evalu, embargo=pd.Timedelta(days=1000))
+        assert result.size == 0
+
+    def test_pre_test_train_never_dropped(self) -> None:
+        """Embargo is asymmetric: rows with pred < eval_max are kept."""
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.array([0, 1, 2])
+        test_idx = np.arange(10, 15)
+        result = apply_embargo(train_idx, test_idx, pred, evalu, embargo=pd.Timedelta(days=1000))
+        np.testing.assert_array_equal(result, train_idx)
+
+    def test_preserves_dtype_and_order(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.array([19, 18, 0], dtype=np.int64)
+        test_idx = np.arange(5, 10)
+        result = apply_embargo(train_idx, test_idx, pred, evalu, embargo=pd.Timedelta(days=2))
+        # All three rows survive (rows 18,19 are past cutoff Jan 13; row 0 is pre-test).
+        np.testing.assert_array_equal(result, train_idx)
+        assert result.dtype == np.int64
+
+    def test_empty_train(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        result = apply_embargo(
+            np.array([], dtype=int),
+            np.arange(5, 10),
+            pred,
+            evalu,
+            embargo=pd.Timedelta(days=1),
+        )
+        assert result.size == 0
+
+    def test_empty_test_returns_input(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        train = np.arange(0, 10)
+        result = apply_embargo(
+            train, np.array([], dtype=int), pred, evalu, embargo=pd.Timedelta(days=1)
+        )
+        np.testing.assert_array_equal(result, train)
+
+    def test_empty_python_lists_are_accepted(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        result = apply_embargo([], [], pred, evalu, embargo=pd.Timedelta(days=1))  # type: ignore[arg-type]
+        assert result.size == 0
+        assert result.dtype == np.int64
+
+    @pytest.mark.parametrize(
+        "test_idx",
+        [
+            np.array([-1]),
+            np.array([20]),
+            np.array([1.5]),
+            np.array([[1, 2]]),
+            np.array([False]),
+            np.array([1, 1]),
+        ],
+    )
+    def test_rejects_invalid_positional_indices(self, test_idx: NDArrayAny) -> None:
+        pred, evalu = _make_horizon_dataset()
+        with pytest.raises((TypeError, ValueError)):
+            apply_embargo(np.array([0]), test_idx, pred, evalu, embargo=pd.Timedelta(days=1))
+
+    def test_rejects_malformed_times_on_direct_call(self) -> None:
+        pred = pd.Series(["2024-01-01", "2024-01-02"])
+        evalu = pd.Series(["2024-01-02", "2024-01-03"])
+        with pytest.raises(ValueError, match="datetime-like"):
+            apply_embargo(np.array([0]), np.array([1]), pred, evalu, embargo=pd.Timedelta(days=1))
+
+    def test_embargoed_train_passes_diagnostic(self) -> None:
+        """Output of apply_embargo must satisfy assert_embargo_respected."""
+        from purgedcv.diagnostics import assert_embargo_respected
+
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.arange(0, 20)
+        test_idx = np.arange(5, 10)
+        emb = pd.Timedelta(days=3)
+        embargoed = apply_embargo(train_idx, test_idx, pred, evalu, embargo=emb)
+        assert_embargo_respected(embargoed, test_idx, pred, evalu, embargo=emb)
+
+    def test_disjoint_test_blocks_embargo_each_local_post_test_window(self) -> None:
+        """Embargo must apply after every non-contiguous test block, not
+        only after the final test row."""
+        pred, evalu = _make_horizon_dataset(horizon_days=1, n=12)
+        train_idx = np.array([3, 4, 5, 6, 7, 8])
+        test_idx = np.array([0, 1, 2, 9, 10, 11])
+
+        result = apply_embargo(
+            train_idx,
+            test_idx,
+            pred,
+            evalu,
+            embargo=pd.Timedelta(days=1),
+        )
+
+        # Test rows 0..2 embargo prediction times through Jan 5, so rows
+        # 3 and 4 are removed even though they are far before the final
+        # test block.
+        expected = np.array([5, 6, 7, 8])
+        np.testing.assert_array_equal(result, expected)
+
+
+class TestApplyPositionalEmbargo:
+    def test_observation_count_drops_exact_post_test_rows(self) -> None:
+        """AFML 7.2/7.3: count from the end of the test labels, not the last test row.
+        The last test label [Jan 10, Jan 11] ends at row 10, so rows 11-13 are the
+        3 embargoed rows; row 10 itself overlaps the test labels and goes too."""
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.concatenate([np.arange(0, 5), np.arange(10, 20)])
+
+        result = apply_embargo(
+            train_idx,
+            np.arange(5, 10),
+            pred,
+            evalu,
+            embargo_observations=3,
+        )
+
+        np.testing.assert_array_equal(result, np.concatenate([np.arange(0, 5), np.arange(14, 20)]))
+
+    def test_observation_count_anchors_at_label_end_for_long_horizons(self) -> None:
+        """With 3-day labels the last test label ends at row 12, so 2 embargo
+        rows are 13-14 regardless of where the test block itself ends."""
+        pred, evalu = _make_horizon_dataset(horizon_days=3)
+        train_idx = np.arange(10, 20)
+
+        result = apply_embargo(
+            train_idx,
+            np.arange(5, 10),
+            pred,
+            evalu,
+            embargo_observations=2,
+        )
+
+        np.testing.assert_array_equal(result, np.arange(15, 20))
+
+    def test_fraction_uses_full_dataset_size_and_rounds_down(self) -> None:
+        pred, evalu = _make_horizon_dataset(n=20)
+        train_idx = np.concatenate([np.arange(0, 5), np.arange(10, 20)])
+
+        result = apply_embargo(
+            train_idx,
+            np.arange(5, 10),
+            pred,
+            evalu,
+            embargo_fraction=0.19,
+        )
+
+        # floor(20 * 0.19) == 3 rows after the test labels end at row 10
+        np.testing.assert_array_equal(result, np.concatenate([np.arange(0, 5), np.arange(14, 20)]))
+
+    def test_disjoint_test_blocks_each_get_a_positional_window(self) -> None:
+        pred, evalu = _make_horizon_dataset(n=15)
+        train_idx = np.array([3, 4, 5, 6, 7, 8, 12, 13, 14])
+        test_idx = np.array([0, 1, 2, 9, 10, 11])
+
+        result = apply_embargo(
+            train_idx,
+            test_idx,
+            pred,
+            evalu,
+            embargo_observations=2,
+        )
+
+        # Block {0,1,2}: labels end at row 3 -> rows 3-5 dropped.
+        # Block {9,10,11}: labels end at row 12 -> rows 12-14 dropped.
+        np.testing.assert_array_equal(result, np.array([6, 7, 8]))
+
+    def test_preserves_unsorted_train_order_and_dtype(self) -> None:
+        pred, evalu = _make_horizon_dataset()
+        train_idx = np.array([15, 11, 2, 10, 14], dtype=np.int32)
+
+        result = apply_embargo(
+            train_idx,
+            np.arange(5, 10),
+            pred,
+            evalu,
+            embargo_observations=2,
+        )
+
+        np.testing.assert_array_equal(result, np.array([15, 2, 14], dtype=np.int32))
+        assert result.dtype == np.int32
+
+    @pytest.mark.parametrize(
+        ("kwargs", "error", "message"),
+        [
+            ({"embargo_observations": -1}, ValueError, "at least 0"),
+            ({"embargo_observations": 1.5}, TypeError, "integer"),
+            ({"embargo_observations": True}, TypeError, "integer"),
+            ({"embargo_fraction": -0.01}, ValueError, r"\[0, 1\]"),
+            ({"embargo_fraction": 1.01}, ValueError, r"\[0, 1\]"),
+            ({"embargo_fraction": float("nan")}, ValueError, r"\[0, 1\]"),
+            ({"embargo_fraction": "0.1"}, TypeError, "real number"),
+            ({"embargo_fraction": True}, TypeError, "real number"),
+        ],
+    )
+    def test_rejects_invalid_positional_configuration(
+        self,
+        kwargs: dict[str, object],
+        error: type[Exception],
+        message: str,
+    ) -> None:
+        pred, evalu = _make_horizon_dataset()
+        with pytest.raises(error, match=message):
+            apply_embargo(
+                np.arange(10, 20),
+                np.arange(5, 10),
+                pred,
+                evalu,
+                **kwargs,  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"embargo": "1D", "embargo_observations": 1},
+            {"embargo": "1D", "embargo_fraction": 0.1},
+            {"embargo_observations": 1, "embargo_fraction": 0.1},
+        ],
+    )
+    def test_embargo_modes_are_mutually_exclusive(self, kwargs: dict[str, object]) -> None:
+        pred, evalu = _make_horizon_dataset()
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            apply_embargo(
+                np.arange(10, 20),
+                np.arange(5, 10),
+                pred,
+                evalu,
+                **kwargs,  # type: ignore[arg-type]
+            )
+
+
+def test_apply_embargo_numpy_matches_pandas() -> None:
+    from purgedcv import apply_embargo
+
+    pred_pd = pd.Series(pd.date_range("2024-01-01", periods=20, freq="D"))
+    evalu_pd = pred_pd + pd.Timedelta(days=1)
+    train_idx = np.array([11, 12, 13, 14])
+    test_idx = np.arange(5, 10)
+    out_pd = apply_embargo(train_idx, test_idx, pred_pd, evalu_pd, pd.Timedelta(days=1))
+    out_np = apply_embargo(
+        train_idx, test_idx, pred_pd.to_numpy(), evalu_pd.to_numpy(), pd.Timedelta(days=1)
+    )
+    np.testing.assert_array_equal(out_pd, out_np)

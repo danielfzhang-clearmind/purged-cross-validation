@@ -1,0 +1,251 @@
+# Quickstart
+
+Three short snippets that cover the full surface: the row-level
+primitives, the sklearn splitter you will use most, and Combinatorial
+Purged Cross-Validation with backtest-path reconstruction and the
+deflated-Sharpe statistics. All snippets are runnable on a fresh
+`pip install purgedcv`.
+
+## 1. Row-level primitives
+
+The two functions `purge` and `apply_embargo` are the building blocks
+every splitter ships on top of. They take positional indices, the
+prediction and evaluation timestamps for every row, and return the
+training indices that survive.
+
+```python
+import numpy as np
+import pandas as pd
+from purgedcv import apply_embargo, purge
+
+n = 1000
+pred = pd.Series(pd.date_range("2024-01-01", periods=n, freq="D"))
+evalu = pred + pd.Timedelta(days=5)  # 5-day forward label
+
+train_idx = np.arange(0, 800)
+test_idx = np.arange(800, 900)
+
+train_kept = purge(
+    train_idx, test_idx,
+    prediction_times=pred,
+    evaluation_times=evalu,
+    purge_horizon="5D",
+)
+train_kept = apply_embargo(
+    train_kept, test_idx,
+    prediction_times=pred,
+    evaluation_times=evalu,
+    embargo="2D",
+)
+print(len(train_idx), "->", len(train_kept), "after purge + embargo")
+```
+
+### Choosing an embargo unit
+
+Every splitter, `apply_embargo`, PBO, and `assert_embargo_respected` accepts
+the same three mutually exclusive modes:
+
+```python
+# Wall-clock duration
+apply_embargo(train_idx, test_idx, pred, evalu, embargo="2D")
+
+# Fixed number of rows after the end of each contiguous test block's labels
+apply_embargo(train_idx, test_idx, pred, evalu, embargo_observations=10)
+
+# floor(n_samples * 0.01) rows after the end of each test block's labels
+apply_embargo(train_idx, test_idx, pred, evalu, embargo_fraction=0.01)
+```
+
+Use a duration when elapsed time carries the dependency. Use rows or a
+fraction for bar-based data where serial dependence is naturally expressed in
+observations. As in AFML Snippets 7.2/7.3, positional windows are counted
+from the last row whose prediction time is at or before the block's latest
+evaluation time, not from the last test row. CPCV applies the positional
+window separately after every non-adjacent test block. Supplying more than one mode raises `ValueError`.
+
+`WalkForwardSplit` accepts the same parameters for constructor consistency,
+but its training candidates are always strictly before the test fold, so an
+asymmetric post-test embargo has no rows to remove. Its effective boundary
+control is `purge_horizon`.
+
+## 2. PurgedKFold in `cross_val_score`
+
+Every splitter follows the scikit-learn splitter protocol, so it works
+inside `cross_val_score`, `GridSearchCV`, and `Pipeline` without glue
+code.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.model_selection import cross_val_score
+from purgedcv import PurgedKFold
+
+n, h = 1000, 5
+rng = np.random.default_rng(0)
+features = rng.standard_normal((n, 4))
+labels = rng.standard_normal(n)
+pred = pd.Series(pd.date_range("2024-01-01", periods=n, freq="D"))
+evalu = pred + pd.Timedelta(days=h)
+
+cv = PurgedKFold(
+    n_splits=5,
+    prediction_times=pred,
+    evaluation_times=evalu,
+    purge_horizon=f"{h}D",
+    embargo=f"{h}D",
+)
+scores = cross_val_score(GradientBoostingRegressor(), features, labels, cv=cv)
+print("honest R^2 per fold:", scores)
+```
+
+`PurgedGroupKFold` (entity-level holdout) and `WalkForwardSplit`
+(chronological train-on-the-past, expanding or rolling) follow the same
+constructor pattern.
+
+### Audit what each fold removed
+
+Inspect the splitter first. Before a large model search, call
+`audit_splitter`. It uses the same internal fold pipeline as `split()` and
+reports each filtering stage rather than trying to reconstruct it from the
+final indices.
+
+```python
+from purgedcv import audit_splitter
+
+report = audit_splitter(cv, features)
+print(report[[
+    "fold",
+    "candidate_train_size",
+    "final_train_size",
+    "train_nonempty",
+    "rows_removed_by_purge",
+    "rows_removed_by_embargo",
+    "rows_removed_by_finalization",
+    "rows_added_by_finalization",
+    "candidate_overlap_fraction",
+    "final_overlap_fraction",
+    "train_block_count",
+    "test_block_count",
+]])
+```
+
+`candidate_overlap_fraction` describes the unfiltered candidate train set
+using the splitter's configured `purge_horizon`. For a non-empty candidate set
+it equals `rows_removed_by_purge / candidate_train_size`; it is defined as zero
+when the candidate set is empty. Indices returned by `cv.split()` are already
+final, so passing them to `compute_overlap_fraction` reproduces
+`final_overlap_fraction`, not the candidate value. The standalone function can
+reproduce the candidate value only when you already own the pre-purge indices
+of a custom split and pass the same purge horizon.
+
+For built-in splitters, `final_overlap_fraction` should be zero and
+`temporal_leakage_free` true. On an empty train set that truth is vacuous, so
+check `train_nonempty` before treating a fold as usable. A sliding
+`WalkForwardSplit` performs its window truncation during finalization, hence
+the count appears under `rows_removed_by_finalization`. Built-in splitters
+never add rows there; a positive `rows_added_by_finalization` flags a custom
+finalizer that introduced or swapped indices.
+
+The four time-envelope columns are outer bounds, not claims that the rows form
+one continuous window. CPCV folds can have several disjoint blocks whose train
+and test envelopes overlap while the actual horizons remain clean; use
+`train_block_count`, `test_block_count`, and `final_overlap_fraction` together.
+Subclasses that override `split()` cannot be audited and raise a clear error;
+customize the documented internal hooks instead. Malformed inputs and final
+indices also fail validation normally.
+
+### Sample weights
+
+The splitters carry no scorer of their own; they stay drop-in to
+scikit-learn, so sample weights travel through sklearn's own metadata
+routing rather than through any `purgedcv` argument. Enable routing once,
+then have the estimator request the weight for `fit`. The split itself is
+unaffected: weights ride along with the rows each fold keeps.
+
+```python
+import numpy as np
+import pandas as pd
+import sklearn
+from sklearn.linear_model import Ridge
+from sklearn.metrics import make_scorer, mean_squared_error
+from sklearn.model_selection import cross_val_score
+from purgedcv import PurgedKFold
+
+n, h = 300, 5
+rng = np.random.default_rng(0)
+features = rng.standard_normal((n, 3))
+labels = rng.standard_normal(n)
+weights = rng.uniform(0.5, 1.5, n)
+pred = pd.Series(pd.date_range("2024-01-01", periods=n, freq="D"))
+evalu = pred + pd.Timedelta(days=h)
+cv = PurgedKFold(n_splits=5, prediction_times=pred, evaluation_times=evalu,
+                 purge_horizon=f"{h}D")
+
+sklearn.set_config(enable_metadata_routing=True)
+
+# Train-time weighting only. The estimator requests the weight for fit and
+# explicitly declines it for score, so cross_val_score knows where it goes.
+est = Ridge().set_fit_request(sample_weight=True).set_score_request(sample_weight=False)
+scores = cross_val_score(est, features, labels, cv=cv, params={"sample_weight": weights})
+
+# Weight the score as well: route the weight into fit and into a scorer that
+# also requests it. Without this, the default scorer leaves the test fold
+# unweighted.
+est = Ridge().set_fit_request(sample_weight=True)
+scorer = make_scorer(mean_squared_error, greater_is_better=False).set_score_request(
+    sample_weight=True
+)
+scores_w = cross_val_score(est, features, labels, cv=cv, scoring=scorer,
+                           params={"sample_weight": weights})
+```
+
+The gotcha is the second case: if you route `sample_weight` but leave the
+default scorer, sklearn raises `UnsetMetadataPassedError` because the scorer
+neither requested nor declined the weight. Decline it with
+`set_score_request(sample_weight=False)` for train-only weighting, or pass a
+scorer that requests it for weighted evaluation.
+
+## 3. CPCV + backtest paths + deflated Sharpe
+
+The full workflow from chapter 12 of *Advances in Financial Machine
+Learning*: enumerate `C(N, K)` purged folds, fit-predict on each, assemble
+the per-path out-of-sample predictions with `reconstruct_paths`, and
+correct the resulting Sharpe ratios for the number of model trials.
+
+```python
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import Ridge
+from purgedcv import CombinatorialPurgedCV, deflated_sharpe_ratio
+
+n = 800
+rng = np.random.default_rng(0)
+features = rng.standard_normal((n, 5))
+labels = rng.standard_normal(n)
+pred = pd.Series(pd.date_range("2024-01-01", periods=n, freq="D"))
+evalu = pred + pd.Timedelta(days=3)
+
+cpcv = CombinatorialPurgedCV(
+    n_splits=6,
+    n_test_groups=2,
+    prediction_times=pred,
+    evaluation_times=evalu,
+    purge_horizon="3D",
+)
+paths = cpcv.backtest_paths(Ridge(), features, labels)
+# paths.shape == (n_paths, n_samples); NaN = unseen position
+
+# Treat each per-path mean predicted score as a per-strategy Sharpe-like
+# series and correct for the number of model trials we actually ran.
+per_path_sharpe = np.nanmean(paths, axis=1) / np.nanstd(paths, axis=1)
+dsr = deflated_sharpe_ratio(
+    per_path_sharpe.mean(),
+    n_trials=len(per_path_sharpe),
+    var_sharpe=per_path_sharpe.var(ddof=1),
+)
+print("Deflated Sharpe (probability skill is real):", dsr)
+```
+
+For the full numerical example matching §7.4.1 of the book, see
+[`examples/energy_demand_pjm.ipynb`](examples.md).

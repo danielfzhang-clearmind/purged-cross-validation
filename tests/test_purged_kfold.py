@@ -1,0 +1,301 @@
+"""Unit tests for PurgedKFold and PurgedGroupKFold (D5.2 + D5.3)."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from purgedcv._purged_kfold import PurgedGroupKFold, PurgedKFold
+from purgedcv.diagnostics import assert_no_temporal_leakage
+
+
+def _times(n: int = 20, horizon_days: int = 1) -> tuple[pd.Series, pd.Series]:
+    pred = pd.Series(pd.date_range("2024-01-01", periods=n, freq="D"))
+    evalu = pred + pd.Timedelta(days=horizon_days)
+    return pred, evalu
+
+
+class TestPurgedKFold:
+    def test_fractional_embargo_drops_post_test_rows(self) -> None:
+        pred, evalu = _times(n=20, horizon_days=1)
+        cv = PurgedKFold(
+            n_splits=4,
+            prediction_times=pred,
+            evaluation_times=evalu,
+            embargo_fraction=0.1,
+        )
+
+        train_idx, test_idx = list(cv.split(np.zeros((20, 1))))[1]
+
+        # floor(20 * 0.1) == 2 rows after the test labels end at row 10.
+        np.testing.assert_array_equal(test_idx, np.arange(5, 10))
+        assert 10 not in train_idx
+        assert 11 not in train_idx
+        assert 12 not in train_idx
+        assert 13 in train_idx
+
+    def test_yields_n_splits_folds(self) -> None:
+        pred, evalu = _times(n=20)
+        cv = PurgedKFold(
+            n_splits=5,
+            prediction_times=pred,
+            evaluation_times=evalu,
+        )
+        X = np.zeros((20, 1))  # noqa: N806
+        folds = list(cv.split(X))
+        assert len(folds) == 5
+        assert cv.get_n_splits() == 5
+
+    def test_test_folds_partition_the_indices(self) -> None:
+        """The union of all test folds must equal {0..n-1} exactly."""
+        pred, evalu = _times(n=20)
+        cv = PurgedKFold(
+            n_splits=5,
+            prediction_times=pred,
+            evaluation_times=evalu,
+        )
+        X = np.zeros((20, 1))  # noqa: N806
+        all_test_idx: list[int] = []
+        for _, test_idx in cv.split(X):
+            all_test_idx.extend(test_idx.tolist())
+        assert sorted(all_test_idx) == list(range(20))
+
+    def test_each_test_fold_is_contiguous(self) -> None:
+        pred, evalu = _times(n=20)
+        cv = PurgedKFold(
+            n_splits=5,
+            prediction_times=pred,
+            evaluation_times=evalu,
+        )
+        X = np.zeros((20, 1))  # noqa: N806
+        for _, test_idx in cv.split(X):
+            assert np.all(np.diff(test_idx) == 1)
+
+    def test_purge_horizon_drops_adjacent_train_rows(self) -> None:
+        """With horizon=2D and purge_horizon=2D, train rows adjacent to each
+        test fold must be dropped."""
+        pred, evalu = _times(n=20, horizon_days=2)
+        cv = PurgedKFold(
+            n_splits=5,
+            purge_horizon="2D",
+            prediction_times=pred,
+            evaluation_times=evalu,
+        )
+        X = np.zeros((20, 1))  # noqa: N806
+        for train_idx, test_idx in cv.split(X):
+            assert_no_temporal_leakage(train_idx, test_idx, pred, evalu, purge_horizon="2D")
+
+    def test_fold_layout_matches_hand_computed(self) -> None:
+        """20 rows, n_splits=5, purge=embargo=0: test fold k = [4k, 4k+4)."""
+        pred, evalu = _times(n=20, horizon_days=1)
+        cv = PurgedKFold(
+            n_splits=5,
+            prediction_times=pred,
+            evaluation_times=evalu,
+        )
+        X = np.zeros((20, 1))  # noqa: N806
+        for k, (_, test_idx) in enumerate(cv.split(X)):
+            expected = np.arange(4 * k, 4 * (k + 1))
+            np.testing.assert_array_equal(test_idx, expected)
+
+    def test_rejects_n_splits_below_two(self) -> None:
+        pred, evalu = _times()
+        with pytest.raises(ValueError, match="at least 2"):
+            PurgedKFold(
+                n_splits=1,
+                prediction_times=pred,
+                evaluation_times=evalu,
+            )
+
+    def test_rejects_non_integer_n_splits(self) -> None:
+        pred, evalu = _times()
+        for n_splits in (2.5, True):
+            with pytest.raises(TypeError, match="integer"):
+                PurgedKFold(
+                    n_splits=n_splits,  # type: ignore[arg-type]
+                    prediction_times=pred,
+                    evaluation_times=evalu,
+                )
+
+    def test_zero_purge_retains_full_post_test_complement(self) -> None:
+        """With zero horizons and non-overlapping (zero-length) labels, fold 0's
+        train must equal the full complement of test. This guards against
+        future base-class regressions that would over-purge under the no-op
+        zero-horizon case."""
+        pred, evalu = _times(n=20, horizon_days=0)
+        cv = PurgedKFold(
+            n_splits=5,
+            prediction_times=pred,
+            evaluation_times=evalu,
+        )
+        X = np.zeros((20, 1))  # noqa: N806
+        folds = list(cv.split(X))
+        train0, test0 = folds[0]
+        np.testing.assert_array_equal(test0, np.arange(0, 4))
+        np.testing.assert_array_equal(train0, np.arange(4, 20))
+
+    def test_more_splits_than_samples_yields_empty_folds(self) -> None:
+        """When n_splits > n_samples, _iter_test_indices yields fold_size=0
+        folds for the excess. The base class purge/embargo gracefully handle
+        empty test arrays. Documenting this contract explicitly so a future
+        refactor doesn't silently change the behavior."""
+        pred, evalu = _times(n=5)
+        cv = PurgedKFold(
+            n_splits=10,
+            prediction_times=pred,
+            evaluation_times=evalu,
+        )
+        X = np.zeros((5, 1))  # noqa: N806
+        folds = list(cv.split(X))
+        assert len(folds) == 10
+        # Folds 0..4 get one row each (n_samples=5 distributed across n_splits=10
+        # via floor(5/10)=0 plus 1-extra for the first remainder=5 folds).
+        # Folds 5..9 are empty.
+        fold_sizes = [len(test_idx) for _, test_idx in folds]
+        assert fold_sizes[:5] == [1, 1, 1, 1, 1]
+        assert fold_sizes[5:] == [0, 0, 0, 0, 0]
+
+
+class TestPurgedGroupKFold:
+    def test_positional_embargo_applies_after_each_interleaved_test_run(self) -> None:
+        pred, evalu = _times(n=24)
+        groups = np.arange(24) % 6
+        cv = PurgedGroupKFold(
+            n_splits=3,
+            prediction_times=pred,
+            evaluation_times=evalu,
+            groups=groups,
+            embargo_observations=2,
+        )
+
+        train_idx, test_idx = next(cv.split(np.zeros((24, 1))))
+
+        np.testing.assert_array_equal(test_idx, np.array([0, 1, 6, 7, 12, 13, 18, 19]))
+        # Each run's labels end one row after it, so the 2-row embargo covers
+        # run_end+1..run_end+3 (e.g. 2-4). The row before each later run
+        # (5, 11, 17) touches it and is purged. Only row 23 survives.
+        np.testing.assert_array_equal(train_idx, np.array([23]))
+
+    def test_yields_n_splits_folds(self) -> None:
+        """6 patients, 5 observations each (30 rows), n_splits=3."""
+        pred = pd.Series(pd.date_range("2024-01-01", periods=30, freq="D"))
+        evalu = pred + pd.Timedelta(days=1)
+        groups = pd.Series(np.repeat([0, 1, 2, 3, 4, 5], 5))
+        cv = PurgedGroupKFold(
+            n_splits=3,
+            prediction_times=pred,
+            evaluation_times=evalu,
+            groups=groups,
+        )
+        X = np.zeros((30, 1))  # noqa: N806
+        folds = list(cv.split(X))
+        assert len(folds) == 3
+
+    def test_each_group_appears_in_exactly_one_test_fold(self) -> None:
+        pred = pd.Series(pd.date_range("2024-01-01", periods=30, freq="D"))
+        evalu = pred + pd.Timedelta(days=1)
+        groups = pd.Series(np.repeat([0, 1, 2, 3, 4, 5], 5))
+        cv = PurgedGroupKFold(
+            n_splits=3,
+            prediction_times=pred,
+            evaluation_times=evalu,
+            groups=groups,
+        )
+        X = np.zeros((30, 1))  # noqa: N806
+        seen_groups: dict[int, int] = {}
+        for k, (_, test_idx) in enumerate(cv.split(X)):
+            test_groups = set(groups.iloc[test_idx].tolist())
+            for g in test_groups:
+                assert (
+                    g not in seen_groups
+                ), f"group {g} appeared in fold {seen_groups[g]} AND fold {k}"
+                seen_groups[g] = k
+        assert set(seen_groups.keys()) == {0, 1, 2, 3, 4, 5}
+
+    def test_no_group_leakage_within_fold(self) -> None:
+        pred = pd.Series(pd.date_range("2024-01-01", periods=30, freq="D"))
+        evalu = pred + pd.Timedelta(days=1)
+        groups = pd.Series(np.repeat([0, 1, 2, 3, 4, 5], 5))
+        cv = PurgedGroupKFold(
+            n_splits=3,
+            prediction_times=pred,
+            evaluation_times=evalu,
+            groups=groups,
+        )
+        X = np.zeros((30, 1))  # noqa: N806
+        for train_idx, test_idx in cv.split(X):
+            train_groups = set(groups.iloc[train_idx].tolist())
+            test_groups = set(groups.iloc[test_idx].tolist())
+            assert train_groups & test_groups == set()
+
+    def test_purge_horizon_applies_across_groups(self) -> None:
+        """Even with group-disjointness, purge_horizon must drop rows from
+        OTHER groups whose horizons overlap the test window."""
+        pred = pd.Series(pd.date_range("2024-01-01", periods=12, freq="D"))
+        evalu = pred + pd.Timedelta(days=3)
+        groups = pd.Series(np.repeat([0, 1, 2, 3], 3))
+        cv = PurgedGroupKFold(
+            n_splits=4,
+            purge_horizon="3D",
+            prediction_times=pred,
+            evaluation_times=evalu,
+            groups=groups,
+        )
+        X = np.zeros((12, 1))  # noqa: N806
+        for train_idx, test_idx in cv.split(X):
+            assert_no_temporal_leakage(train_idx, test_idx, pred, evalu, purge_horizon="3D")
+
+    def test_rejects_n_splits_exceeding_unique_groups(self) -> None:
+        pred = pd.Series(pd.date_range("2024-01-01", periods=10, freq="D"))
+        evalu = pred + pd.Timedelta(days=1)
+        groups = pd.Series([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])  # 5 unique groups
+        with pytest.raises(ValueError, match=r"exceeds.*unique groups"):
+            PurgedGroupKFold(
+                n_splits=10,
+                prediction_times=pred,
+                evaluation_times=evalu,
+                groups=groups,
+            )
+
+    def test_rejects_n_splits_below_two(self) -> None:
+        pred = pd.Series(pd.date_range("2024-01-01", periods=10, freq="D"))
+        evalu = pred + pd.Timedelta(days=1)
+        groups = pd.Series([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+        with pytest.raises(ValueError, match="at least 2"):
+            PurgedGroupKFold(
+                n_splits=1,
+                prediction_times=pred,
+                evaluation_times=evalu,
+                groups=groups,
+            )
+
+    def test_rejects_non_integer_n_splits(self) -> None:
+        pred = pd.Series(pd.date_range("2024-01-01", periods=10, freq="D"))
+        evalu = pred + pd.Timedelta(days=1)
+        groups = pd.Series([0, 0, 1, 1, 2, 2, 3, 3, 4, 4])
+        for n_splits in (2.5, True):
+            with pytest.raises(TypeError, match="integer"):
+                PurgedGroupKFold(
+                    n_splits=n_splits,  # type: ignore[arg-type]
+                    prediction_times=pred,
+                    evaluation_times=evalu,
+                    groups=groups,
+                )
+
+
+def test_purged_group_kfold_accepts_numpy_groups() -> None:
+    from purgedcv import PurgedGroupKFold
+
+    n = 12
+    pred = pd.date_range("2024-01-01", periods=n, freq="D").to_numpy()
+    evalu = pred + np.timedelta64(1, "D")
+    groups = np.repeat(np.arange(4), 3)  # 0,0,0,1,1,1,2,2,2,3,3,3
+    splitter = PurgedGroupKFold(
+        n_splits=2, prediction_times=pred, evaluation_times=evalu, groups=groups
+    )
+    folds = list(splitter.split(np.zeros((n, 1))))
+    assert len(folds) == 2
+    # every index assigned to some test fold, none shared
+    all_test = np.concatenate([test for _, test in folds])
+    assert sorted(all_test.tolist()) == list(range(n))
